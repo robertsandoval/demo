@@ -1,0 +1,103 @@
+---
+- name: Creating an EC2 Instance with Creating a VPC and Subnet Id
+  hosts: localhost
+  tasks:
+    - name: Create a new VPC 
+      amazon.aws.ec2_vpc_net:
+        name: "Ansible-VPC"
+        cidr_block: "{{ cidr_block }}"
+        region: "{{ region }}"
+      register: vpc
+  
+    - name: Create a new Subnet
+      amazon.aws.ec2_vpc_subnet:
+        cidr: "{{ cidr }}"
+        region: "{{ region }}"
+        vpc_id: "{{ vpc.vpc.id }}"
+      register: subnet
+
+    - ansible.builtin.debug:
+        var: subnet.subnet.id
+    
+    - name: Create a Security Group  
+      amazon.aws.ec2_security_group:
+        name: "Ansible-Security-Group"
+        description: "Ansible Security Group - allow port 80 and 22"
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            ports:
+            - 80
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "allow all on port 80"
+          - proto: tcp
+            ports:
+            - 22
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "allow all on port 22"
+          - proto: tcp
+            ports:
+            - 5432
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "allow all on port 5432"
+      register: security_group
+    
+    - ansible.builtin.debug:
+        var: security_group.group_id
+
+    - name: Create VPC IGW 
+      amazon.aws.ec2_vpc_igw:
+        region: "{{ region }}"
+        vpc_id: "{{ vpc.vpc.id }}"
+      register: igw
+      until: igw is not failed
+      retries: 15 
+
+    - name: Set VPC public subnet route table
+      amazon.aws.ec2_vpc_route_table:
+        region: "{{ region }}"
+        vpc_id: "{{ vpc.vpc.id }}"
+        subnets:
+          - "{{ subnet.subnet.id }}"
+        routes: 
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ igw.gateway_id }}"
+      register: routetable
+      until: routetable is not failed
+      retries: 5
+
+    - name: Launch an EC2 Instance
+      amazon.aws.ec2_instance:
+        name: "{{ ec2_instance_name }}"
+        state: running
+        key_name: "{{ key_name }}"
+        vpc_subnet_id: "{{ subnet.subnet.id }}"
+        instance_type: "{{ instance_type }}"
+        security_group: "{{ security_group.group_id  }}"
+        count: 1
+        wait: yes
+        aws_region: "{{ region }}"
+        network:
+          assign_public_ip: true
+        image_id: "{{ ami }}"
+        tags:
+          App: database
+      register: ec2
+
+    - name: Create DNS record in Route53 for our server
+      amazon.aws.route53:
+        state: present
+        overwrite: true
+        zone: "sandbox2898.opentlc.com"
+        record: "{{ ec2_instance_name }}.sandbox2898.opentlc.com"
+        type: A
+        value: "{{ ec2.instances[0].public_ip_address }}"
+
+    - name: Update Controller AWS Inventory with new EC2 instance
+      awx.awx.inventory_source_update:
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        name: "AWS Environment"
+        inventory: "AWS Inventory"
+        organization: Default
